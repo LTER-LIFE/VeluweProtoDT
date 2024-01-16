@@ -1,68 +1,98 @@
-# Get NDVI data
+# Get NDVI data from AgroDataCube
 # Author: Stefan Vriend
 # Created: 2024/01/15
-# Last updated: 2024/01/15
+# Last updated: 2024/01/16
 
 library(httr)
 library(terra)
+library(here)
+library(keyring)
+library(lubridate)
+library(tibble)
 
-bbox <- tibble::tribble(~x, ~y,
-                        5.824436777442551, 52.032393019069225,
-                        5.824436777442551, 52.046647934312794,
-                        5.870356194968013, 52.046647934312794,
-                        5.870356194968013, 52.032393019069225,
-                        5.824436777442551, 52.032393019069225)
+# Function to retrieve NDVI data from AgroDataCube ------------------------
 
-bbox_rd <- tibble::tribble(~x, ~y,
-                           185000, 449500,
-                           185000, 451000,
-                           188000, 451000,
-                           188000, 449500,
-                           185000, 449500)
+# Arguments
+# - bbox: tibble or data frame specifying the x and y coordinates of bounding box for which to retrieve data. The data frame should have 5 x and y coordinates, specifying the corners of the bounding box (where the starting corner is listed twice to ensure that the polygon is closed). CRS should be Amersfoort / RD New (EPSG:28992).
+# - date: date specifying the date for which to retrieve data.
+# - key: character specifying a AgroDataCube V2 API key.
 
-test <- httr::GET(url = paste0("https://agrodatacube.wur.nl/api/v2/rest/ndvi_image?",
-                               "date=20191119",
-                               "&geometry=POLYGON((",
-                               paste(paste(bbox_rd$x, bbox_rd$y, sep = "%20"), collapse = ","),
-                               "))",
-                               "&epsg=28992",
-                               "&output_epsg=4326"),
-                  httr::add_headers(token = keyring::key_get(service = "RStudio Keyring Secrets",
-                                                             username = "AgroDataCube V2 API key")))
+retrieve_adc_data <- function(bbox,
+                              date,
+                              key = keyring::key_get(service = "RStudio Keyring Secrets",
+                                                     username = "AgroDataCube V2 API key")) {
 
+  # Check that the bounding box has correct dimensions
+  if(any(dim(bbox) != c(5, 2))) {
 
-bin_raster <- readBin(test$content, what = "raw", n=length(test$content))
-writeBin(bin_raster, con = "raster.tif")
-r <- raster::raster("raster.tif")
+    stop("The bounding box does not have the correct dimensions.")
 
-## CHECK THIS
-# https://community.rstudio.com/t/convert-a-binary-post-request-to-a-local-raster/158656/4
-###
+  }
 
-test$content |>
-  tiff::readTIFF() |>
-  terra::rast()
+  # Change date to expected format (yyyymmdd)
+  formatted_date <- paste0(lubridate::year(date),
+                           stringr::str_pad(lubridate::month(date), width = 2,
+                                            side = "left",
+                                            pad = "0"),
+                           stringr::str_pad(lubridate::day(date), width = 2,
+                                            side = "left",
+                                            pad = "0"))
 
-httr::content(test, as = "text")
+  # Call API
+  adc <- httr::GET(url = paste0("https://agrodatacube.wur.nl/api/v2/rest/ndvi_image?",
+                                "date=", formatted_date,
+                                "&geometry=POLYGON((",
+                                paste(paste(bbox$x, bbox$y, sep = "%20"), collapse = ","),
+                                "))",
+                                "&epsg=28992",
+                                "&output_epsg=4326"),
+                   httr::add_headers(token = key))
 
-terra_test <- terra::rast(file.choose())
+  # Error message
+  if("status" %in% httr::content(adc)) {
 
-#
-# headers = c(
-#   'Accept' = 'application/json',
-#   'Authorization' = keyring::key_get(service = "RStudio Keyring Secrets",
-#                              username = "AgroDataCube V2 API key")
-# )
-#
-# res <- httr::VERB("GET", url = paste0("https://agrodatacube.wur.nl/api/v2/rest/ndvi_image?date=20191110&geometry=POINT((",
-#                                       paste(bbox_rd[1, 1], bbox_rd[1, 2], sep = ' '), "))",
-#                                       "&epsg=28992&output_epsg=4326"), httr::add_headers(headers))
-#
-# httr::content(res)
-#
-#
-# library(httr)
-#
-# res <- httr::VERB("GET", url = "https://agrodatacube.wur.nl/api/v2/rest/ndvi_image?date=20191119&geometry=POLYGON((185000%20449500,185000%20451000,188000%20451000,188000%20449500,185000%20449500))&epsg=28992&output_epsg=4326", httr::add_headers(headers))
-#
-# cat(content(res, 'text'))
+    stop("AgroDataCube V2.0 API failed to fulfill request for the following reason:\n")
+    httr::content(adc)$status
+
+  }
+
+  # Write raw content to temporary .tif
+  writeBin(adc$content, con = here::here("data", paste0(formatted_date, ".tif")))
+  on.exit(unlink(here::here("data", paste0(formatted_date, ".tif"))), add = TRUE)
+
+  r <- terra::rast(here::here("data", paste0(formatted_date, ".tif")))
+
+  output <- terra::as.data.frame(r, xy = TRUE) |>
+    dplyr::rename("value" = rlang::sym(formatted_date)) |>
+    dplyr::mutate("date" = date)
+
+  return(output)
+
+}
+
+# Set bounding box using Amersfoort / RD New (EPSG:28992)
+bbox_ <- tibble::tribble(~x, ~y,
+                         185000, 449500,
+                         185000, 451000,
+                         188000, 451000,
+                         188000, 449500,
+                         185000, 449500)
+
+#retrieve_adc_data(bbox = bbox, date = lubridate::make_date(2019, 11, 19))
+
+# Set dates (from https://www.groenmonitor.nl/groenindex)
+adc_dates <- c(lubridate::make_date(2017, 5, 26),
+               lubridate::make_date(2018, 6, 30),
+               lubridate::make_date(2019, 6, 27),
+               lubridate::make_date(2020, 6, 26),
+               lubridate::make_date(2021, 6, 1),
+               lubridate::make_date(2022, 6, 16),
+               lubridate::make_date(2023, 6, 24))
+
+ndvi <- purrr::map(.x = adc_dates,
+                   .f = ~{
+
+                     retrieve_adc_data(bbox = bbox, date = .x)
+
+                   }) |>
+  dplyr::bind_rows()
